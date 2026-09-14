@@ -1,72 +1,73 @@
-# Claude Code
+# OpenCode Security Guidance
 
-![](https://img.shields.io/badge/Node.js-18%2B-brightgreen?style=flat-square) [![npm]](https://www.npmjs.com/package/@anthropic-ai/claude-code)
+OpenCode Security Guidance is an independent, work-in-progress OpenCode port of Anthropic's `security-guidance` plugin. The original project and its upstream implementation belong to Anthropic. This repository is not an official Anthropic product, is not endorsed by Anthropic, and does not imply Anthropic support.
 
-[npm]: https://img.shields.io/npm/v/@anthropic-ai/claude-code.svg?style=flat-square
+The repository preserves the initial upstream snapshot first. OpenCode compatibility work will be introduced in separate, reviewable changes rather than mixed into the baseline import.
 
-Claude Code is an agentic coding tool that lives in your terminal, understands your codebase, and helps you code faster by executing routine tasks, explaining complex code, and handling git workflows -- all through natural language commands. Use it in your terminal, IDE, or tag @claude on Github.
+## Overview
 
-**Learn more in the [official documentation](https://code.claude.com/docs/en/overview)**.
+The imported security-guidance implementation provides three layers of security review:
 
-<img src="./demo.gif" />
+1. Pattern-based warnings for known-dangerous code patterns.
+2. LLM-powered review of diffs.
+3. Agentic review around commits, with repository context for tracing data flow.
 
-## Get started
-> [!NOTE]
-> Installation via npm is deprecated. Use one of the recommended methods below.
+These capabilities are retained as the upstream baseline. The runtime and hook lifecycle still require adaptation to the OpenCode plugin API.
 
-For more installation options, uninstall steps, and troubleshooting, see the [setup documentation](https://code.claude.com/docs/en/setup).
+## Status
 
-1. Install Claude Code:
+**Work in progress / Initial OpenCode port**
 
-    **MacOS/Linux (Recommended):**
-    ```bash
-    curl -fsSL https://claude.ai/install.sh | bash
-    ```
+The current branch is a faithful upstream baseline import. It is not yet a completed or supported OpenCode plugin. Do not treat the current snapshot as proof of OpenCode integration, hook lifecycle compatibility, or production readiness.
 
-    **Homebrew (MacOS/Linux):**
-    ```bash
-    brew install --cask claude-code
-    ```
+## Architecture
 
-    **Windows (Recommended):**
-    ```powershell
-    irm https://claude.ai/install.ps1 | iex
-    ```
+The baseline keeps the upstream implementation in a small root-level layout:
 
-    **WinGet (Windows):**
-    ```powershell
-    winget install Anthropic.ClaudeCode
-    ```
+- `.claude-plugin/plugin.json` — retained upstream manifest for baseline provenance.
+- `hooks/` — upstream Python hook and review implementation.
+- `tests/` — upstream tests currently covering repository resolution.
+- `LICENSE` — upstream Apache License 2.0 text.
 
-    **NPM (Deprecated):**
-    ```bash
-    npm install -g @anthropic-ai/claude-code
-    ```
+Future port work will adapt the hook entry points, event lifecycle, configuration, and runtime integration to OpenCode's plugin API. Claude-specific files and behavior are intentionally not rewritten in this baseline commit so that later changes remain auditable against the exact upstream snapshot.
 
-2. Navigate to your project directory and run `claude`.
+## Installation
 
-## Plugins
+Installation is not available yet. The OpenCode plugin integration must be completed and verified before this project should be installed on a clean OpenCode environment.
 
-This repository includes several Claude Code plugins that extend functionality with custom commands and agents. See the [plugins directory](./plugins/README.md) for detailed documentation on available plugins.
+## Configuration
 
-## Reporting Bugs
+No OpenCode configuration contract is defined yet. The baseline contains upstream Claude-oriented environment variables, including `SECURITY_REVIEW_MODEL`, `ENABLE_PATTERN_RULES`, `ENABLE_CODE_SECURITY_REVIEW`, `ENABLE_STOP_REVIEW`, and `ENABLE_COMMIT_REVIEW`; these names and semantics must not be assumed to be the final OpenCode interface.
 
-We welcome your feedback. Use the `/bug` command to report issues directly within Claude Code, or file a [GitHub issue](https://github.com/anthropics/claude-code/issues).
+When the OpenCode adapter is implemented, this section will document supported configuration, defaults, credential handling, and provider routing.
 
-## Connect on Discord
+## Security model
 
-Join the [Claude Developers Discord](https://anthropic.com/discord) to connect with other developers using Claude Code. Get help, share feedback, and discuss your projects with the community.
+Security findings are assistive signals, not a guarantee. Reviews can miss vulnerabilities and can produce false positives. Use normal human review, dependency scanning, and appropriate SAST/DAST or penetration testing for security-sensitive systems.
 
-## Data collection, usage, and retention
+Any future LLM review integration must make data flow explicit. Changed paths, diff content, related file contents, and organization-specific policy text may be sent to the configured model endpoint. Do not place secrets in policy files or review inputs. Provider retention and privacy terms apply to the configured endpoint.
 
-When you use Claude Code, we collect feedback, which includes usage data (such as code acceptance or rejections), associated conversation data, and user feedback submitted via the `/bug` command.
+The OpenCode port must also verify hook lifecycle behavior, false-positive handling, and commit/push review behavior before release.
 
-### How we use your data
+## Upstream
 
-See our [data usage policies](https://code.claude.com/docs/en/data-usage).
+The source project is Anthropic's official `security-guidance` plugin:
 
-### Privacy safeguards
+- Repository: <https://github.com/anthropics/claude-plugins-official>
+- Path: [`plugins/security-guidance`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/security-guidance)
+- Initial upstream commit: `da823e86c8feef13b73b6712af11eadd38c992f6`
+- Upstream commit date: `2026-09-14T13:20:24-04:00`
 
-We have implemented several safeguards to protect your data, including limited retention periods for sensitive information, restricted access to user session data, and clear policies against using feedback for model training.
+See [UPSTREAM.md](UPSTREAM.md) for the review-only update workflow. Upstream changes must be analyzed and ported deliberately; this repository must not merge the entire upstream repository.
 
-For full details, please review our [Commercial Terms of Service](https://www.anthropic.com/legal/commercial-terms) and [Privacy Policy](https://www.anthropic.com/legal/privacy).
+## License
+
+The imported upstream work is licensed under the Apache License 2.0. See [LICENSE](LICENSE). Attribution and provenance are recorded in [NOTICE](NOTICE) and [UPSTREAM.md](UPSTREAM.md).
+
+## Credits
+
+- Original `security-guidance` project: Anthropic.
+- Original plugin author listed in the upstream manifest: David Dworken.
+- OpenCode compatibility work: contributors to this repository.
+
+This project is an independent derivative work and is not maintained, sponsored, or approved by Anthropic.

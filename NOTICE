@@ -1,0 +1,13 @@
+This project is derived from Anthropic's security-guidance plugin.
+
+Original project:
+https://github.com/anthropics/claude-plugins-official/tree/main/plugins/security-guidance
+
+Original upstream commit:
+da823e86c8feef13b73b6712af11eadd38c992f6
+
+Original work is licensed under the Apache License 2.0.
+
+This project contains modifications for compatibility with OpenCode.
+
+This repository is an independent project and is not an official Anthropic product or an Anthropic-supported OpenCode port.
