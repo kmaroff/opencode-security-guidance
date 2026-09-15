@@ -90,16 +90,46 @@ def user_patterns() -> List[Dict[str, Any]]:
 
 
 def _config_paths(cwd: Optional[str], basename: str) -> List[Tuple[str, str]]:
-    """Existing config file paths, lowest precedence first (so concat reads in
-    precedence order user → project → project-local). Truncation is done on
-    the concatenated string, so lowest-precedence content is dropped last."""
-    paths = [("User", os.path.expanduser(os.path.join("~", ".claude", basename)))]
+    """Return OpenCode-native paths, with legacy Claude fallback.
+
+    Native files win as a group when present; this avoids silently merging
+    two configuration systems with ambiguous precedence.
+    """
+    if basename == GUIDANCE_BASENAME:
+        native = [
+            ("User", os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "opencode", "security-guidance", "security-guidance.md")),
+        ]
+        if cwd:
+            native.extend([
+                ("Project", os.path.join(cwd, ".opencode", "security-guidance.md")),
+                ("Project (local)", os.path.join(cwd, ".opencode", "security-guidance.local.md")),
+            ])
+        if any(os.path.isfile(p) for _, p in native):
+            return native
+        legacy = [("User", os.path.expanduser(os.path.join("~", ".claude", basename)))]
+        if cwd:
+            legacy.extend([
+                ("Project", os.path.join(cwd, ".claude", basename)),
+                ("Project (local)", os.path.join(cwd, ".claude", "claude-security-guidance.local.md")),
+            ])
+        return legacy
+    native = [("User", os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "opencode", "security-guidance", "security-patterns"))]
     if cwd:
-        paths.append(("Project", os.path.join(cwd, ".claude", basename)))
-        # claude-security-guidance.local.md / security-patterns.local.yaml
+        native.extend([
+            ("Project", os.path.join(cwd, ".opencode", "security-patterns")),
+            ("Project (local)", os.path.join(cwd, ".opencode", "security-patterns.local")),
+        ])
+    native_exists = any(os.path.isfile(f"{p}{ext}") for _, p in native for ext in (".yaml", ".yml", ".json"))
+    if native_exists:
+        return native
+    legacy = [("User", os.path.expanduser(os.path.join("~", ".claude", basename)))]
+    if cwd:
         stem, ext = os.path.splitext(basename)
-        paths.append(("Project (local)", os.path.join(cwd, ".claude", f"{stem}.local{ext}")))
-    return paths
+        legacy.extend([
+            ("Project", os.path.join(cwd, ".claude", basename)),
+            ("Project (local)", os.path.join(cwd, ".claude", f"{stem}.local{ext}")),
+        ])
+    return legacy
 
 
 def _load_guidance(cwd: Optional[str]) -> str:

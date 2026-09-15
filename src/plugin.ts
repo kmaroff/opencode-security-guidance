@@ -8,9 +8,9 @@ import { sessionCoordinator } from "./coordination/session.js"
 import { loadSessionState, updateSessionState, type SessionState } from "./coordination/state.js"
 import { repoReviewCoordinator } from "./locking/repository-lock.js"
 import { createLogger } from "./logging/logger.js"
+import { safeHandler } from "./lifecycle/safe-handler.js"
 import { ReviewClient, ReviewFailure } from "./review/client.js"
 import { feedbackMarker, formatFeedback, hasFeedbackMarker } from "./review/feedback.js"
-
 type UnknownRecord = Record<string, unknown>
 type ToolAfterInput = { tool: string; sessionID: string; callID: string; args: unknown }
 type ToolAfterOutput = { title: string; output: string; metadata: unknown }
@@ -104,7 +104,7 @@ async function sessionInfo(client: OpencodeClient, sessionID: string, directory:
 
 async function promptAsync(client: OpencodeClient, sessionID: string, directory: string, model: { providerID: string; modelID: string }, text: string): Promise<void> {
   const prompt = client.session.promptAsync as unknown as (options: unknown) => Promise<unknown>
-  await prompt({ path: { id: sessionID }, query: { directory }, body: { model, parts: [{ type: "text", text }] } })
+  await prompt.call(client.session, { path: { id: sessionID }, query: { directory }, body: { model, parts: [{ type: "text", text }] } })
 }
 
 const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
@@ -113,10 +113,9 @@ const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
   const config = loaded.config
   const log = createLogger(config.debug)
   if (loaded.diagnostic) log("config", { errorKind: "invalid_config" })
+  log("loaded", { enabled: config.enabled, debug: config.debug })
   const bridge = new BridgeClient(root)
   const review = new ReviewClient(client, bridge, config)
-  const reviewerSessions = new Set<string>()
-  const initializedSessions = new Set<string>()
 
   async function capturePrompt(sessionID: string, model: UnknownRecord | undefined, parts: unknown): Promise<void> {
     await sessionCoordinator(sessionID).enqueue(async () => {
@@ -141,7 +140,6 @@ const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
       state.reviewGeneration = 0
       state.syntheticFeedback = false
       updateSessionState(sessionID, next => Object.assign(next, state))
-      initializedSessions.add(sessionID)
     })
   }
 
@@ -233,9 +231,9 @@ const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
       const coordinator = repoReviewCoordinator(pushData.repoRoot)
       const outcome = await coordinator.enqueue(async () => {
         const findings = data.diffFiles && data.diffFiles.length > 0
-          ? (await review.run({ sessionID: input.sessionID, directory: worktree || directory, repoRoot: data.repoRoot as string, diffFiles: data.diffFiles, parentModel: loadSessionState(input.sessionID).parentModel, agentic: isCommit })).findings
+          ? (await review.run({ sessionID: input.sessionID, directory: worktree || directory, repoRoot: pushData.repoRoot as string, diffFiles: data.diffFiles, parentModel: loadSessionState(input.sessionID).parentModel, agentic: isCommit })).findings
           : []
-        bridge.call("git.markReviewed", { repoRoot: data.repoRoot, shas, findings: findings.length })
+        bridge.call("git.markReviewed", { repoRoot: pushData.repoRoot, shas, findings: findings.length })
         return findings
       }).catch(error => {
         log(isCommit ? "commit_review" : "push_review", { sessionID: input.sessionID, errorKind: error instanceof ReviewFailure ? error.kind : "workflow_error" })
@@ -248,10 +246,12 @@ const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
   async function idle(event: IdleEvent): Promise<void> {
     if (!config.enabled) return
     const info = await sessionInfo(client, event.sessionID, worktree || directory)
-    if (info.title?.startsWith("security-guidance reviewer")) { reviewerSessions.add(event.sessionID); return }
+    if (info.title?.startsWith("security-guidance reviewer")) return
     const statusValue = unwrap(await client.session.status({ query: { directory: worktree || directory } }))
     const status = record(statusValue)[event.sessionID]
-    if (record(status).type !== "idle") return
+    const statusType = record(status).type
+    log("idle_state", { statusType: typeof statusType === "string" ? statusType : "missing", statusKeys: Object.keys(record(statusValue)).join(",") })
+    if (statusType === "busy" || statusType === "retry") return
     const messages = unwrap(await client.session.messages({ path: { id: event.sessionID }, query: { directory: worktree || directory, limit: 50 } }))
     const fingerprint = hash(JSON.stringify({ count: Array.isArray(messages) ? messages.length : 0, last: record(record(Array.isArray(messages) ? messages[messages.length - 1] : undefined).info).id }))
     const state = loadSessionState(event.sessionID)
@@ -262,19 +262,21 @@ const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
   }
 
   const hooks: Hooks = {
-    "chat.message": async (input, output) => { await capturePrompt(input.sessionID, input.model, output.parts) },
-    "tool.execute.after": async (input, output) => {
+    "chat.message": safeHandler("chat_hook", async (input, output) => { await capturePrompt(input.sessionID, input.model, output.parts) }, config.debug),
+    "tool.execute.before": safeHandler("tool_before_hook", async () => {}, config.debug),
+    "tool.execute.after": safeHandler("tool_after_hook", async (input, output) => {
       const normalizedInput: ToolAfterInput = { tool: input.tool, sessionID: input.sessionID, callID: input.callID, args: input.args }
       const normalizedOutput: ToolAfterOutput = { title: output.title, output: output.output, metadata: output.metadata }
       await patternAfter(normalizedInput, normalizedOutput)
       output.output = normalizedOutput.output
       await commitOrPush(normalizedInput, normalizedOutput)
-    },
+    }, config.debug),
     event: async ({ event }: { event: Event }) => {
       try {
         const candidate = event as unknown as { type?: string; properties?: unknown }
         if (candidate.type === "session.idle") {
           const properties = record(candidate.properties)
+          log("event_seen", { eventType: candidate.type, sessionID: typeof properties.sessionID === "string" ? properties.sessionID : undefined })
           if (typeof properties.sessionID === "string") await idle({ sessionID: properties.sessionID })
         }
       } catch (error) {
