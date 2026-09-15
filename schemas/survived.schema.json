@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencode-security-guidance.local/schema/survived-v1.json",
+  "title": "Security Guidance Refutation Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["survived"],
+  "properties": {
+    "survived": { "type": "array", "items": { "type": "integer", "minimum": 0 } },
+    "refuted": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["idx", "reason"],
+        "properties": {
+          "idx": { "type": "integer", "minimum": 0 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

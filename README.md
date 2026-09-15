@@ -1,73 +1,114 @@
 # OpenCode Security Guidance
 
-OpenCode Security Guidance is an independent, work-in-progress OpenCode port of Anthropic's `security-guidance` plugin. The original project and its upstream implementation belong to Anthropic. This repository is not an official Anthropic product, is not endorsed by Anthropic, and does not imply Anthropic support.
+Independent alpha port of Anthropic's `security-guidance` plugin for OpenCode 1.18.29. The original project and upstream implementation belong to Anthropic. This repository is not an official Anthropic product, is not endorsed by Anthropic, and does not imply Anthropic support.
 
-The repository preserves the initial upstream snapshot first. OpenCode compatibility work will be introduced in separate, reviewable changes rather than mixed into the baseline import.
+## Alpha status
 
-## Overview
+This branch (`port/opencode-v0.1`) contains a working local alpha. It is intentionally not a release, does not touch a canonical OpenCode server, and does not modify LaunchAgents, SSH configuration, or production configuration.
 
-The imported security-guidance implementation provides three layers of security review:
+The port keeps the upstream Python checker and Git logic, adds an OpenCode TypeScript plugin lifecycle, and communicates with the Python core through a bounded one-shot bridge.
 
-1. Pattern-based warnings for known-dangerous code patterns.
-2. LLM-powered review of diffs.
-3. Agentic review around commits, with repository context for tracing data flow.
+## Capabilities
 
-These capabilities are retained as the upstream baseline. The runtime and hook lifecycle still require adaptation to the OpenCode plugin API.
+- Pattern warnings after OpenCode write/edit tools.
+- Baseline-relative review after `session.idle`.
+- Strict local validation of structured findings.
+- Optional agentic refutation for child-session reviews.
+- Commit and push review with reviewed-SHA deduplication.
+- Per-session state, per-session serialization, and per-repository locking.
+- OpenCode-native policy and custom-pattern files with legacy Claude fallback.
 
-## Status
+## Install locally
 
-**Work in progress / Initial OpenCode port**
+```sh
+npm ci
+npm run build
+```
 
-The current branch is a faithful upstream baseline import. It is not yet a completed or supported OpenCode plugin. Do not treat the current snapshot as proof of OpenCode integration, hook lifecycle compatibility, or production readiness.
+The build produces the loadable plugin artifact at `dist/plugin.js`. Register that
+absolute path in the isolated OpenCode project or user configuration:
+```json
+{
+  "plugin": ["/absolute/path/to/opencode-security-guidance/dist/plugin.js"]
+}
+```
 
-## Architecture
-
-The baseline keeps the upstream implementation in a small root-level layout:
-
-- `.claude-plugin/plugin.json` — retained upstream manifest for baseline provenance.
-- `hooks/` — upstream Python hook and review implementation.
-- `tests/` — upstream tests currently covering repository resolution.
-- `LICENSE` — upstream Apache License 2.0 text.
-
-Future port work will adapt the hook entry points, event lifecycle, configuration, and runtime integration to OpenCode's plugin API. Claude-specific files and behavior are intentionally not rewritten in this baseline commit so that later changes remain auditable against the exact upstream snapshot.
-
-## Installation
-
-Installation is not available yet. The OpenCode plugin integration must be completed and verified before this project should be installed on a clean OpenCode environment.
+The plugin is loaded by OpenCode; it does not start or reconfigure an OpenCode server.
 
 ## Configuration
 
-No OpenCode configuration contract is defined yet. The baseline contains upstream Claude-oriented environment variables, including `SECURITY_REVIEW_MODEL`, `ENABLE_PATTERN_RULES`, `ENABLE_CODE_SECURITY_REVIEW`, `ENABLE_STOP_REVIEW`, and `ENABLE_COMMIT_REVIEW`; these names and semantics must not be assumed to be the final OpenCode interface.
+Configuration is JSON and applies in this order (later values win):
 
-When the OpenCode adapter is implemented, this section will document supported configuration, defaults, credential handling, and provider routing.
+1. `$XDG_CONFIG_HOME/opencode/security-guidance/config.json`
+2. `.opencode/security-guidance.json`
+3. `.opencode/security-guidance.local.json`
+
+Example:
+
+```json
+{
+  "enabled": true,
+  "patterns": true,
+  "stopReview": true,
+  "commitReview": true,
+  "pushReview": true,
+  "debug": false,
+  "reviewer": {
+    "provider": "openai",
+    "model": "gpt-5.6-luna",
+    "inheritParent": false
+  }
+}
+```
+
+Reviewer routing requires both `provider` and `model`, unless `inheritParent` is true and the active session supplies both. Invalid JSON, unknown fields, and invalid types disable the plugin rather than silently changing behavior.
+
+## Native policy and patterns
+
+Native OpenCode files:
+
+- `$XDG_CONFIG_HOME/opencode/security-guidance/security-guidance.md`
+- `.opencode/security-guidance.md`
+- `.opencode/security-guidance.local.md`
+- Matching `security-patterns.yaml`, `security-patterns.yml`, or `security-patterns.json` files in those locations.
+
+Native files win as a group. Legacy `.claude/` files are read only when no native file exists.
+
+## Diagnostics and state
+
+Default locations:
+
+- State: `~/.local/state/opencode/security-guidance/`
+- Debug log: `~/.local/state/opencode/security-guidance/logs/runtime.log`
+
+Set `"debug": true` to enable bounded lifecycle diagnostics. Logs contain operation names, error kinds, and session identifiers; they do not contain prompts, diffs, source contents, provider responses, or credentials.
 
 ## Security model
 
-Security findings are assistive signals, not a guarantee. Reviews can miss vulnerabilities and can produce false positives. Use normal human review, dependency scanning, and appropriate SAST/DAST or penetration testing for security-sensitive systems.
+Findings are assistive signals, not a guarantee. Reviews can miss vulnerabilities and produce false positives. Continue normal human review and use appropriate SAST, DAST, dependency scanning, and penetration testing.
 
-Any future LLM review integration must make data flow explicit. Changed paths, diff content, related file contents, and organization-specific policy text may be sent to the configured model endpoint. Do not place secrets in policy files or review inputs. Provider retention and privacy terms apply to the configured endpoint.
+Changed paths, diff content, policy text, and selected repository context may be sent to the configured reviewer provider. Do not put secrets in policy files or source diffs that should not leave the configured trust boundary. Provider retention and privacy terms apply.
 
-The OpenCode port must also verify hook lifecycle behavior, false-positive handling, and commit/push review behavior before release.
+## Verification
 
-## Upstream
+The repository includes bridge regressions and retains the upstream Python tests.
+Create the development Python environment once, then run:
 
-The source project is Anthropic's official `security-guidance` plugin:
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+npm ci
+npm test
+```
 
-- Repository: <https://github.com/anthropics/claude-plugins-official>
-- Path: [`plugins/security-guidance`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/security-guidance)
-- Initial upstream commit: `da823e86c8feef13b73b6712af11eadd38c992f6`
-- Upstream commit date: `2026-09-14T13:20:24-04:00`
+`npm run smoke:opencode` builds the artifact, starts OpenCode on a dynamically
+allocated loopback port, verifies `/global/health`, and tears the server down.
+It does not touch the canonical OpenCode server or production configuration.
 
-See [UPSTREAM.md](UPSTREAM.md) for the review-only update workflow. Upstream changes must be analyzed and ported deliberately; this repository must not merge the entire upstream repository.
+For architecture, lifecycle invariants, and the parity matrix, see [`docs/architecture.md`](docs/architecture.md) and [`docs/parity.md`](docs/parity.md).
 
-## License
+## Upstream and license
 
-The imported upstream work is licensed under the Apache License 2.0. See [LICENSE](LICENSE). Attribution and provenance are recorded in [NOTICE](NOTICE) and [UPSTREAM.md](UPSTREAM.md).
+Source project: [Anthropic's official `security-guidance` plugin](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/security-guidance).
 
-## Credits
-
-- Original `security-guidance` project: Anthropic.
-- Original plugin author listed in the upstream manifest: David Dworken.
-- OpenCode compatibility work: contributors to this repository.
-
-This project is an independent derivative work and is not maintained, sponsored, or approved by Anthropic.
+The imported work is licensed under Apache License 2.0. Attribution and provenance are recorded in [`NOTICE`](NOTICE) and [`UPSTREAM.md`](UPSTREAM.md). This independent derivative is not maintained, sponsored, or approved by Anthropic.
