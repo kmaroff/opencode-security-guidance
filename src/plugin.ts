@@ -47,7 +47,8 @@ function listPaths(value: unknown): string[] {
     if (typeof body[key] === "string" && body[key]) result.push(body[key] as string)
   }
   for (const key of ["files", "paths"]) {
-    if (Array.isArray(body[key])) for (const item of body[key]) {
+    if (!Array.isArray(body[key])) continue
+    for (const item of body[key]) {
       if (typeof item === "string") result.push(item)
       else {
         const file = stringField(item, "path", "file", "filePath")
@@ -55,7 +56,21 @@ function listPaths(value: unknown): string[] {
       }
     }
   }
+  for (const key of ["patchText", "patch", "diff"]) {
+    if (typeof body[key] !== "string") continue
+    const source = body[key] as string
+    const patchPaths = /(?:\*\*\* (?:Add|Update|Delete) File:\s*|diff --git a\/)([^\s\n]+)/g
+    for (const match of source.matchAll(patchPaths)) if (match[1]) result.push(match[1])
+  }
   return [...new Set(result)]
+}
+
+function contentField(value: unknown): string | undefined {
+  const body = record(value)
+  for (const key of ["content", "newString", "new_string", "patchText", "patch", "diff"]) {
+    if (typeof body[key] === "string" && body[key]) return body[key] as string
+  }
+  return undefined
 }
 
 function absolutePath(file: string, directory: string): string {
@@ -143,7 +158,7 @@ const SecurityGuidance: Plugin = async ({ client, directory, worktree }) => {
       for (const file of paths) if (!state.touchedPaths.includes(file)) state.touchedPaths.push(file)
       updateSessionState(input.sessionID, next => Object.assign(next, state))
       if (!config.patterns) return
-      const content = stringField(args, "content", "newString", "new_string", "patch", "diff") || output.output || ""
+      const content = contentField(args) || output.output || ""
       let baselineContent: string | undefined
       try { baselineContent = bridge.call<{ content?: string }>("git.baselineContent", { cwd: worktree || directory, baselineSha: state.baselineSha, path: paths[0] }).content } catch { /* no baseline is fail-open */ }
       const result = bridge.call<{ matches: Array<{ ruleName: string; reminder: string }> }>("pattern.scan", { cwd: worktree || directory, path: paths[0], content, baselineContent })
