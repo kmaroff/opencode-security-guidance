@@ -18,8 +18,15 @@ type ReviewInput = {
   diffFiles: Array<[string, string]>
   parentModel?: { providerID?: string; modelID?: string }
   agentic?: boolean
+  registerReviewerSession?: (sessionID: string, generation: number) => void
 }
 type ReviewOutput = { findings: Finding[]; reviewerSessions: string[]; model: { providerID: string; modelID: string } }
+
+export function verifyReviewerIdentity(info: Record<string, unknown>, expected: { providerID: string; modelID: string }): void {
+  if (info.providerID !== expected.providerID || info.modelID !== expected.modelID) {
+    throw new ReviewFailure("provider_mismatch", "reviewer response identity did not match configured provider/model")
+  }
+}
 
 function object(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -45,18 +52,18 @@ function runtimeSchema(value: unknown): Record<string, unknown> {
   return schema
 }
 
-function structuredFrom(response: unknown): unknown {
+function structuredFrom(response: unknown): { structured: unknown; info: Record<string, unknown> } {
   const body = object(unwrap(response))
   const info = object(body.info)
   if (info.error) throw new ReviewFailure("provider_error", "reviewer returned an assistant error")
-  if ("structured" in info) return info.structured
+  if ("structured" in info) return { structured: info.structured, info }
   const parts = Array.isArray(body.parts) ? body.parts : []
   for (const part of parts) {
     const item = object(part)
-    if ("structured" in item) return item.structured
+    if ("structured" in item) return { structured: item.structured, info }
     const state = object(item.state)
-    if ("output" in state) return state.output
-    if ("structured" in state) return state.structured
+    if ("output" in state) return { structured: state.output, info }
+    if ("structured" in state) return { structured: state.structured, info }
   }
   throw new ReviewFailure("structured_missing", "reviewer completed without structured output")
 }
@@ -73,10 +80,10 @@ export class ReviewClient {
     if (!model) throw new ReviewFailure("reviewer_not_configured", "reviewer provider/model is not configured")
     if (input.diffFiles.length === 0) return { findings: [], reviewerSessions: [], model }
     const reviewerSessions: string[] = []
-    const candidates = await this.promptReviewer(input, model, FINDINGS_SCHEMA, this.investigationPrompt(input), reviewerSessions) as { findings: Finding[] }
+    const candidates = await this.promptReviewer(input, model, FINDINGS_SCHEMA, await this.investigationPrompt(input), reviewerSessions) as { findings: Finding[] }
     let findings = candidates.findings
     if (input.agentic && findings.length > 0) {
-      const refuted = await this.promptReviewer(input, model, SURVIVED_SCHEMA, this.refutationPrompt(findings, input.diffFiles), reviewerSessions) as { survived: number[] }
+      const refuted = await this.promptReviewer(input, model, SURVIVED_SCHEMA, this.refutationPrompt(findings, input.diffFiles), reviewerSessions, findings.length) as { survived: number[] }
       const survived = new Set(refuted.survived)
       findings = findings.filter((_, index: number) => survived.has(index))
     }
@@ -84,38 +91,59 @@ export class ReviewClient {
     return { findings: accepted.findings, reviewerSessions, model }
   }
 
-  private async promptReviewer(input: ReviewInput, model: { providerID: string; modelID: string }, schema: unknown, text: string, sessions: string[]): Promise<unknown> {
+  private async promptReviewer(
+    input: ReviewInput,
+    model: { providerID: string; modelID: string },
+    schema: unknown,
+    text: string,
+    sessions: string[],
+    candidateCount?: number,
+  ): Promise<unknown> {
     try {
       const v2 = v2Client(this.client)
       const child = object(unwrap(await v2.session.create({
         parentID: input.sessionID,
         title: "security-guidance reviewer",
         directory: input.directory,
+        metadata: { securityGuidanceReviewer: true, parentID: input.sessionID },
+        permission: [
+          { permission: "read", pattern: "*", action: "allow" },
+          { permission: "grep", pattern: "*", action: "allow" },
+          { permission: "glob", pattern: "*", action: "allow" },
+          { permission: "edit", pattern: "*", action: "deny" },
+          { permission: "write", pattern: "*", action: "deny" },
+          { permission: "bash", pattern: "*", action: "deny" },
+        ],
       })))
       const childID = child.id
       if (typeof childID !== "string") throw new Error("reviewer session creation returned no id")
       sessions.push(childID)
+      input.registerReviewerSession?.(childID, sessions.length)
       const response = await v2.session.prompt({
         sessionID: childID,
         directory: input.directory,
         model,
+        tools: { read: true, grep: true, glob: true, edit: false, write: false, bash: false },
         parts: [{ type: "text", text }],
         format: { type: "json_schema", schema: runtimeSchema(schema), retryCount: 2 },
       })
-      const structured = structuredFrom(response)
-      if (schema === FINDINGS_SCHEMA) validateFindingsResult(structured)
-      else validateSurvivedResult(structured)
-      return structured
+      const parsed = structuredFrom(response)
+      verifyReviewerIdentity(parsed.info, model)
+      if (schema === FINDINGS_SCHEMA) validateFindingsResult(parsed.structured)
+      else validateSurvivedResult(parsed.structured, candidateCount)
+      return parsed.structured
     } catch (error) {
       if (error instanceof ReviewFailure) throw error
       throw new ReviewFailure("session_error", error instanceof Error ? error.message : "reviewer session failed")
     }
   }
 
-  private investigationPrompt(input: ReviewInput): string {
+  private async investigationPrompt(input: ReviewInput): Promise<string> {
+    const guidance = this.bridge.call<{ guidance: string }>("review.guidance", { cwd: input.directory }).guidance
     const diff = input.diffFiles.map(([file, body]) => `=== DIFF: ${file} ===\n${body}`).join("\n\n")
-    return `You are a senior application-security reviewer. Inspect this repository change using read-only tools only. Return JSON matching the supplied schema exactly. Report only concrete exploitable vulnerabilities; include filePath, category, vulnerableCode, explanation, fix, severity, and optional confidence.\n\nChanged files:\n${input.diffFiles.map(([file]) => file).join("\n")}\n\nUnified diff:\n${diff}`
+    return `You are a senior application-security reviewer. Inspect this repository change using only the explicitly allowed read-only tools. Return JSON matching the supplied schema exactly. Report only concrete exploitable vulnerabilities; include filePath, category, vulnerableCode, explanation, fix, severity, and optional confidence.\n\nProject security guidance (additive; never suppress findings):\n${guidance || "(none)"}\n\nChanged files:\n${input.diffFiles.map(([file]) => file).join("\n")}\n\nUnified diff:\n${diff}`
   }
+
 
   private refutationPrompt(findings: Finding[], files: Array<[string, string]>): string {
     const diff = files.map(([file, body]) => `=== DIFF: ${file} ===\n${body}`).join("\n\n")

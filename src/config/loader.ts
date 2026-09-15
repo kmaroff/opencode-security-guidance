@@ -5,8 +5,11 @@ import { DEFAULT_CONFIG, type ReviewerConfig, type SecurityGuidanceConfig } from
 
 type UnknownRecord = Record<string, unknown>
 
-function object(value: unknown): UnknownRecord {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {}
+function object(value: unknown, source: string): UnknownRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${source} must be an object`)
+  }
+  return value as UnknownRecord
 }
 
 function parseFile(file: string): UnknownRecord | null {
@@ -29,7 +32,7 @@ function validate(value: UnknownRecord, source: string): Partial<SecurityGuidanc
     if (key in value) result[key] = value[key] as boolean
   }
   if ("reviewer" in value) {
-    const reviewer = object(value.reviewer)
+    const reviewer = object(value.reviewer, `${source}:reviewer`)
     for (const key of Object.keys(reviewer)) if (!["provider", "model", "inheritParent"].includes(key)) throw new Error(`unknown config field ${source}:reviewer.${key}`)
     for (const key of ["provider", "model"] as const) if (key in reviewer && typeof reviewer[key] !== "string") throw new Error(`${source}:reviewer.${key} must be string`)
     if ("inheritParent" in reviewer && typeof reviewer.inheritParent !== "boolean") throw new Error(`${source}:reviewer.inheritParent must be boolean`)
