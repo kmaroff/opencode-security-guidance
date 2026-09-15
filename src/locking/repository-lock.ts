@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { closeSync, mkdirSync, openSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 
 const RETRY_MS = 50
@@ -32,8 +32,8 @@ export class RepositoryLock {
   }
 }
 
-const locks = new Map<string, RepositoryLock>()
 const tails = new Map<string, Promise<void>>()
+
 export class RepoReviewCoordinator {
   constructor(private readonly repoRoot: string) {}
 
@@ -46,9 +46,7 @@ export class RepoReviewCoordinator {
 }
 
 export function repoReviewCoordinator(repoRoot: string): RepoReviewCoordinator {
-  // The map is intentionally only a process-local optimization; RepositoryLock
-  // remains the correctness boundary across plugin processes.
-  let lock = locks.get(repoRoot)
-  if (!lock) { lock = new RepositoryLock(repoRoot); locks.set(repoRoot, lock) }
+  // The queue is a process-local optimization; RepositoryLock remains the
+  // correctness boundary across plugin processes.
   return new RepoReviewCoordinator(repoRoot)
 }
