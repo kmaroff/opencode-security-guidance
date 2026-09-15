@@ -1,0 +1,22 @@
+{
+  "name": "opencode-security-guidance",
+  "version": "0.1.0-alpha.1",
+  "description": "Independent OpenCode port of Anthropic security-guidance",
+  "type": "module",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "npm run build && python3 -m pytest",
+    "test:python": "python3 -m pytest",
+    "test:bridge": "python3 -m pytest test/test_bridge.py"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.29",
+    "ajv": "8.17.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.2",
+    "typescript": "5.8.3"
+  }
+}
