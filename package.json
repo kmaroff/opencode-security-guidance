@@ -6,10 +6,12 @@
   "private": true,
   "license": "Apache-2.0",
   "scripts": {
-    "build": "tsc --noEmit",
-    "test": "npm run build && python3 -m pytest",
-    "test:python": "python3 -m pytest",
-    "test:bridge": "python3 -m pytest test/test_bridge.py"
+    "build": "tsc",
+    "test": "npm run build && npm run test:ts && ./scripts/run-pytest.sh",
+    "test:ts": "rm -rf .test-dist && tsc -p tsconfig.test.json && node --test .test-dist/test-ts/*.test.js",
+    "test:python": "./scripts/run-pytest.sh",
+    "test:bridge": "./scripts/run-pytest.sh test/test_bridge.py",
+    "smoke:opencode": "npm run build && ./scripts/opencode-smoke.sh"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.18.29",

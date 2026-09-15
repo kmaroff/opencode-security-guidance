@@ -21,12 +21,12 @@ The port keeps the upstream Python checker and Git logic, adds an OpenCode TypeS
 ## Install locally
 
 ```sh
-npm install
+npm ci
 npm run build
 ```
 
-Register the built plugin path in the OpenCode project or user configuration:
-
+The build produces the loadable plugin artifact at `dist/plugin.js`. Register that
+absolute path in the isolated OpenCode project or user configuration:
 ```json
 {
   "plugin": ["/absolute/path/to/opencode-security-guidance/dist/plugin.js"]
@@ -89,16 +89,21 @@ Findings are assistive signals, not a guarantee. Reviews can miss vulnerabilitie
 
 Changed paths, diff content, policy text, and selected repository context may be sent to the configured reviewer provider. Do not put secrets in policy files or source diffs that should not leave the configured trust boundary. Provider retention and privacy terms apply.
 
-Review failure is fail-open for the user workflow: no clean verdict or reviewed-SHA acknowledgement is recorded, and a later eligible trigger may retry. Pattern checks remain available in non-Git directories; Git review simply has no review set.
-
 ## Verification
 
-The repository includes bridge regressions and retains the upstream Python tests. The implementation has been checked with:
+The repository includes bridge regressions and retains the upstream Python tests.
+Create the development Python environment once, then run:
 
 ```sh
-npm run build
-/tmp/opencode-security-guidance-venv/bin/python -m pytest -q
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+npm ci
+npm test
 ```
+
+`npm run smoke:opencode` builds the artifact, starts OpenCode on a dynamically
+allocated loopback port, verifies `/global/health`, and tears the server down.
+It does not touch the canonical OpenCode server or production configuration.
 
 For architecture, lifecycle invariants, and the parity matrix, see [`docs/architecture.md`](docs/architecture.md) and [`docs/parity.md`](docs/parity.md).
 
