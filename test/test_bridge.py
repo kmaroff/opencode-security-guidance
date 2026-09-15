@@ -79,10 +79,14 @@ def _git(cwd, *args):
 
 
 def test_commit_data_and_reviewed_sha_acknowledgement(tmp_path):
-    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "init", "-q", "-b", "main")
     _git(tmp_path, "config", "user.email", "security@example.test")
     _git(tmp_path, "config", "user.name", "Security Test")
     source = tmp_path / "app.py"
+    source.write_text("print('initial')\n")
+    _git(tmp_path, "add", "app.py")
+    _git(tmp_path, "commit", "-qm", "initial")
+    before = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
     source.write_text("print('new')\n")
     _git(tmp_path, "add", "app.py")
     _git(tmp_path, "commit", "-qm", "add app")
@@ -91,9 +95,59 @@ def test_commit_data_and_reviewed_sha_acknowledgement(tmp_path):
         "op": "git.commitData",
         "cwd": str(tmp_path),
         "command": "git commit -m add app",
-        "output": f"[main {sha[:7]}] add app\n 1 file changed, 1 insertion(+)",
+        "beforeHead": before,
+        "output": "commit completed without a SHA",
     })
     assert body["result"]["shas"] == [sha]
     assert body["result"]["diffFiles"][0][0] == "app.py"
     _, marked = request({"op": "git.markReviewed", "repoRoot": str(tmp_path), "shas": [sha], "findings": 0})
     assert marked["result"] == {"acknowledged": True, "shas": [sha]}
+
+
+def test_push_data_reviews_reported_local_ref_not_checked_out_head(tmp_path):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.email", "security@example.test")
+    _git(tmp_path, "config", "user.name", "Security Test")
+    source = tmp_path / "app.py"
+    source.write_text("print('initial')\n")
+    _git(tmp_path, "add", "app.py")
+    _git(tmp_path, "commit", "-qm", "initial")
+    _git(tmp_path, "switch", "-q", "-c", "feature")
+    source.write_text("print('feature')\n")
+    _git(tmp_path, "add", "app.py")
+    _git(tmp_path, "commit", "-qm", "feature")
+    feature = _git(tmp_path, "rev-parse", "feature").stdout.strip()
+    main = _git(tmp_path, "rev-parse", "main").stdout.strip()
+    _git(tmp_path, "switch", "-q", "main")
+    _, body = request({
+        "op": "git.pushData",
+        "cwd": str(tmp_path),
+        "command": "git push origin feature",
+        "exitCode": 0,
+        "output": f"To example\n   {main[:7]}..{feature[:7]}  feature -> origin/feature\n",
+    })
+    assert body.get("result"), body
+    assert body["result"]["newSha"] == feature
+    assert body["result"]["diffFiles"][0][0] == "app.py"
+
+
+def test_push_data_rejects_forged_reported_tip(tmp_path):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.email", "security@example.test")
+    _git(tmp_path, "config", "user.name", "Security Test")
+    source = tmp_path / "app.py"
+    source.write_text("print('initial')\n")
+    _git(tmp_path, "add", "app.py")
+    _git(tmp_path, "commit", "-qm", "initial")
+    old = _git(tmp_path, "rev-parse", "HEAD").stdout.strip()
+    source.write_text("print('new')\n")
+    _git(tmp_path, "add", "app.py")
+    _git(tmp_path, "commit", "-qm", "new")
+    _, body = request({
+        "op": "git.pushData",
+        "cwd": str(tmp_path),
+        "command": "git push origin main",
+        "exitCode": 0,
+        "output": f"To example\\n   {old[:7]}..deadbee  main -> origin/main\\n",
+    })
+    assert body["error"]["kind"] == "push_target_resolution_failed"

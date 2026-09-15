@@ -120,10 +120,9 @@ from diffstate import (  # noqa: E402,F401
     UNTRACKED_BASELINE_CAP, _list_untracked, compute_v2_review_set,
 )
 from reporesolve import (  # noqa: E402,F401
-    RES_NONE, RES_CWD, RES_COMMAND, RES_SHA_SCAN, RES_TOUCHED_PATHS, RES_HINT,
+    RES_NONE, RES_CWD, RES_COMMAND, RES_TOUCHED_PATHS, RES_HINT,
     COMMIT_SUBCOMMANDS, PUSH_SUBCOMMANDS,
-    toplevel_from_command, repo_containing_commit, scan_roots,
-    resolve_repo_root, save_repo_hint, load_repo_hint,
+    toplevel_from_command, resolve_repo_root, save_repo_hint, load_repo_hint,
 )
 import llm  # noqa: E402  module ref for reassignable globals (_last_call_claude_http_error etc.)
 from llm import (  # noqa: E402,F401
@@ -651,31 +650,15 @@ def _resolve_amend_pre_sha(repo_root, expected_post_sha=None):
     # Cross-repo guard: the post-amend SHA the caller is about to review must
     # match HEAD@{0} of repo_root. Otherwise the bash command was likely run
     # in a different repo than repo_root, and the reflog we just read is
-    # unrelated. Prefix-compare: expected_post_sha is typically the 7-char
-    # abbreviated SHA captured from bash stdout by _COMMIT_SHA_RE (git's
-    # default core.abbrev floor), while head0_sha is the full 40-char %H —
-    # strict equality would always fail and silently disable the delta path.
+    # Compare the verified post-commit object to the reflog SHA. The reflog
+    # normally contains the full object name, but prefix comparison keeps this
+    # helper safe for callers that hold an abbreviated Git object name.
     if expected_post_sha and not head0_sha.startswith(expected_post_sha):
         return None
     return head1_sha or None
 
 # git-only signals that corroborate a real commit object — NOT emitted by
-# pre-commit / lint-staged / husky hook output, which can contain bracketed
-# labels like `[pre-commit abc1234]` that otherwise look like a commit line.
-_COMMIT_DIFFSTAT_PATTERNS = [
-    re.compile(r'\b\d+ files? changed'),
-    re.compile(r'^ create mode ', re.MULTILINE),
-    re.compile(r'^ delete mode ', re.MULTILINE),
-    re.compile(r'^ rename ', re.MULTILINE),
-]
 
-# Capture-group form of the [branch sha] pattern. Mirrors Claude Code's own
-# commit-id parsing, but tolerates spaces before the
-# sha (covers `[detached HEAD abc1234]`). 7–40 hex chars: git's abbrev floor
-# through full sha; the abbrev resolves fine with `git show`. Anchored to
-# line-start so a `[hex]` in the commit subject (`[main abc] Revert [e38]`)
-# or trailing hook output isn't picked up and fed to `git show`.
-_COMMIT_SHA_RE = re.compile(r'^\[[^\]]*?\b([0-9a-f]{7,40})\]', re.MULTILINE)
 
 # Regex matching `git commit` commands. Mirrors Claude Code's own commit
 # detection — it does NOT tolerate `git -c k=v commit` global options, which
@@ -750,7 +733,7 @@ _GIT_PUSH_RE = re.compile(
 # diffing — `git push origin other` while on a different branch would
 # otherwise diff the wrong range.
 _PUSH_RANGE_RE = re.compile(
-    r'^\s*\+?\s*([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})\s+(\S+)\s+->\s+\S+',
+    r'^\s*\+?\s*([0-9a-f]{7,40})\.\.\.?([0-9a-f]{7,40})\s+(\S+)\s+->\s+(\S+)',
     re.MULTILINE,
 )
 
@@ -1028,12 +1011,9 @@ def _agentic_review_with_race(
 def handle_commit_review_posttooluse(input_data):
     """PostToolUse handler for Bash — reviews git commits for security issues.
 
-    Runs as asyncRewake: detects `git commit` in the Bash command, parses
-    the resulting SHA(s) from the Bash stdout `[branch sha] msg` line, runs
-    `git show -p <sha>` per SHA, sends the combined diff through
-    analyze_code_security, and exits with code 2 (stderr findings) to wake
-    the model. Deduplicates against the shared previous_findings state so
-    the Stop hook won't re-flag the same (filePath, vulnerableCode) pair.
+    The repository and commit identities come from the command target, Git
+    reflog, and Git object reads. Bash stdout is diagnostic only and is never
+    parsed for SHA-like tokens.
     """
     session_id = input_data.get("session_id", "default")
     tool_input = input_data.get("tool_input", {})
@@ -1042,40 +1022,22 @@ def handle_commit_review_posttooluse(input_data):
 
     command = tool_input.get("command", "")
     if not isinstance(command, str) or not _GIT_COMMIT_RE.search(command):
-        # Defensive only — hooks.json's `"if": "Bash(git commit:*)"` is the
-        # real gate so CC never spawns python3 for ls/grep/etc. This catches
-        # cases where CC's command matching fails open and spawns the hook anyway.
         sys.exit(0)
 
     debug_log(f"Commit review: detected git commit in command")
 
-    # Bash tool_response has no exit_code field (only stdout, stderr,
-    # interrupted), so success is inferred from the output text — the same
-    # heuristic Claude Code itself uses.
+    # OpenCode/Claude hook payloads may omit an exit code. Never use stdout
+    # hex tokens as a commit identity; Git state and the reflog are the
+    # authority. An explicit non-zero status or interruption is failure.
     if not isinstance(tool_response, dict):
         tool_response = {}
-    stdout = tool_response.get("stdout", "") or ""
-    stderr = tool_response.get("stderr", "") or ""
+    stdout = str(tool_response.get("stdout", "") or "")
+    stderr = str(tool_response.get("stderr", "") or "")
     bash_output = stdout + "\n" + stderr
     interrupted = bool(tool_response.get("interrupted"))
+    exit_code = tool_response.get("exit_code", tool_response.get("exitCode"))
 
-    # Require BOTH a line-anchored `[branch sha]` AND a git-only diffstat
-    # signal before treating the tool call as a successful commit. The old
-    # `any()` check false-positived on (a) pre-commit/husky/lint-staged hooks
-    # emitting labels like `[pre-commit abc1234]`, and on (b) chained
-    # `git commit || git log --stat` where `N files changed` appears in output
-    # even though the commit itself failed.
-    all_shas = _COMMIT_SHA_RE.findall(bash_output)
-    commit_succeeded = (
-        not interrupted
-        and bool(all_shas)
-        and any(p.search(bash_output) for p in _COMMIT_DIFFSTAT_PATTERNS)
-    )
-
-    # commit_review_on emitted on every path so telemetry can filter on
-    # commit_review and group by commit_review_on.
     _base = {"commit_review": True, "commit_review_on": COMMIT_REVIEW_ENABLED}
-
     cwd_root = _git_toplevel(cwd) if cwd else None
     repo_root = cwd_root
     repo_res = RES_CWD if cwd_root else RES_NONE
@@ -1087,178 +1049,56 @@ def handle_commit_review_posttooluse(input_data):
         _base["cwd_is_repo"] = False
     if repo_res != RES_CWD:
         _base["repo_resolution"] = repo_res
-
-    # Reflog fallback for hidden stdout. Analysis of skip_reason=21 emissions
-    # showed a large share were commits that DID succeed
-    # but whose `[branch sha]` line was hidden by piping/redirection/-q
-    # (e.g., `git commit -m ... 2>&1 | tail -3`). A HEAD@{0}
-    # reflog check substantially reduced this skip; follow-up analysis found
-    # the residual is dominated by (a) chained commands moving HEAD@{0} past
-    # `commit:` (`git commit && git push`), and (b) the `_obvious_noop` guard
-    # false-positiving on chained `git status` output after a successful -q
-    # commit. Widening to the last-5-entries × 120s scan and dropping the noop
-    # guard fixes both. The reviewed-shas dedup below prevents the wider window
-    # from re-reviewing a prior Bash call's commit, and is the same file
-    # push-sweep reads — so a SHA is reviewed at most once across both
-    # surfaces. See _git_reflog_recent_commits docstring for cross-repo /
-    # race safety.
-    _reflog_shas: List[str] = []
-    _skip_21_sub = 0
-    if not commit_succeeded and not interrupted and cwd:
-        if not repo_root:
-            repo_root = load_repo_hint(session_id)
-            if repo_root:
-                repo_res = RES_HINT
-                _base["repo_resolution"] = repo_res
-        _root = repo_root
-        _fresh, _stale = _git_reflog_recent_commits(_root)
-        if _fresh:
-            _already = _load_reviewed_shas(_root)
-            _reflog_shas = [s for s in _fresh if s not in _already]
-            if _reflog_shas:
-                commit_succeeded = True
-                debug_log(
-                    f"Commit review: stdout had no `[branch sha]`; reflog "
-                    f"shows {len(_reflog_shas)} fresh unreviewed commit(s) "
-                    f"({_reflog_shas[0][:12]}...)"
-                )
-            else:
-                # Fresh commit(s) in reflog but all already in
-                # sg-reviewed-shas — likely a Bash retry or the commit was
-                # reviewed via a prior fire. Correct to skip; sub=2 lets telemetry
-                # split this from genuine fails.
-                _skip_21_sub = 2
-        elif _stale:
-            _skip_21_sub = 3  # commit entries exist but all >120s old
-        else:
-            _skip_21_sub = 4  # no commit-action entries — genuine fail
-
-    if not commit_succeeded:
-        debug_log("Commit review: commit did not succeed, skipping")
-        emit_metrics({"skipped": True, "skip_reason": 21, **_base,
-                      **({"skip_21_sub": 1} if interrupted
-                         else {"skip_21_sub": _skip_21_sub} if _skip_21_sub
-                         else {})})
-        sys.exit(0)
-
-    if not COMMIT_REVIEW_ENABLED:
-        debug_log("Commit review: disabled, skipping")
-        emit_metrics({"skipped": True, "skip_reason": 32, **_base})
-        sys.exit(0)
-
-    if not ENABLE_CODE_SECURITY_REVIEW or not HAS_API_CREDENTIALS:
-        debug_log("Commit review: LLM review disabled or no API credentials")
-        emit_metrics({"skipped": True, "skip_reason": 22, **_base})
-        sys.exit(0)
-
-    if not ensure_anthropic_reachable():
-        debug_log("Commit review: api.anthropic.com unreachable")
-        emit_metrics({"skipped": True, "skip_reason": 24, **_base})
-        sys.exit(0)
-
-    if not cwd:
-        debug_log("Commit review: no cwd")
-        emit_metrics({"skipped": True, "skip_reason": 25, **_base})
-        sys.exit(0)
-
-    if not repo_root and all_shas and not _reflog_shas:
-        repo_root = repo_containing_commit(all_shas[-1], scan_roots(cwd))
-        if repo_root:
-            repo_res = RES_SHA_SCAN
     if not repo_root:
         repo_root = load_repo_hint(session_id)
         if repo_root:
             repo_res = RES_HINT
-    if repo_res != RES_CWD:
-        _base["repo_resolution"] = repo_res
+            _base["repo_resolution"] = repo_res
     if not repo_root:
-        debug_log("Commit review: not in a git repo")
         emit_metrics({"skipped": True, "skip_reason": 26, **_base})
         sys.exit(0)
+
+    failure_text = bash_output.lower()
+    explicit_failure = (
+        interrupted
+        or (isinstance(exit_code, int) and exit_code != 0)
+        or "nothing to commit" in failure_text
+        or re.search(r"\b(?:fatal|error|failed|rejected):", failure_text) is not None
+    )
+    fresh, stale = _git_reflog_recent_commits(repo_root)
+    commit_count = max(1, len(_GIT_COMMIT_RE.findall(command)))
+    fresh = fresh[:commit_count]
+    reviewed = _load_reviewed_shas(repo_root)
+    _reflog_shas = [sha for sha in fresh if sha not in reviewed]
+    if explicit_failure or not _reflog_shas:
+        emit_metrics({"skipped": True, "skip_reason": 21, **_base,
+                      "skip_21_sub": 1 if interrupted else 4 if not fresh else 2})
+        sys.exit(0)
+    commit_succeeded = True
+    shas = _reflog_shas
+    _base = {**_base, "sha_via_reflog": True, "reflog_shas_n": len(shas)}
     if repo_res != RES_CWD:
         debug_log(f"Commit review: repo resolved via {repo_res} -> {repo_root!r}")
         if repo_res in (RES_COMMAND, RES_TOUCHED_PATHS):
             save_repo_hint(session_id, repo_root)
-
-    # Pin the review to the exact SHA the Bash command produced, parsed from
-    # its stdout. Reviewing HEAD instead is wrong when the commit was made in
-    # a different repo than the hook's cwd (`cd ../other && git commit && cd -`,
-    # subshells), or when a second commit lands before this async hook reaches
-    # `git show` — both would review an unrelated commit. The reflog-action
-    # fallback above is the narrow exception: it only fires when output gave
-    # us nothing AND the cwd repo's own reflog confirms a `commit:` just
-    # happened there, which rules out the cross-repo case.
-    #
-    # Take only the LAST match: pre-commit/husky hooks can print bracketed
-    # labels like `[pre-commit abc1234]` that precede the real `[branch sha]`
-    # line; chained commands like `git commit && git commit` produce multiple
-    # real SHAs and we want the most recent. The real commit line is always
-    # last in git's own output — the earlier matches are either decoys or
-    # superseded commits.
-    if _reflog_shas:
-        # Output-based detection already failed above; the reflog SHAs are the
-        # authoritative ones. Don't re-parse bash_output here — any bracketed
-        # token it contains is by construction NOT the `[branch sha]` line
-        # (or commit_succeeded would have been True via the fast path). The
-        # list is newest-first and may contain >1 entry when a single Bash
-        # call made multiple commits (`git commit -m a && git commit -m b`);
-        # all are reviewed.
-        shas = _reflog_shas
-    else:
-        shas = [all_shas[-1]] if all_shas else []
-    if not shas:
-        debug_log("Commit review: no SHA in commit output")
-        emit_metrics({"skipped": True, "skip_reason": 33, **_base})
+    if not COMMIT_REVIEW_ENABLED:
+        debug_log("Commit review: disabled, skipping")
+        emit_metrics({"skipped": True, "skip_reason": 32, **_base})
         sys.exit(0)
-    if _reflog_shas:
-        # Observability: track how often the fallback path is hit so
-        # future analysis can split on it.
-        # `reflog_shas_n` lets telemetry measure how often the widened scan picked
-        # up >1 commit (i.e., chained `git commit && git commit`).
-        _base = {**_base, "sha_via_reflog": True,
-                 "reflog_shas_n": len(_reflog_shas)}
-
-    # `git commit --amend`: review only the delta added by the amend
-    # (pre-amend..post-amend) instead of the full amended commit. Without this,
-    # the amend re-reviews the entire commit including code already reviewed
-    # on the original commit, costing 30-60s of LLM time and re-flagging
-    # findings the user may have just amended IN ORDER TO fix. Pre-amend
-    # SHA comes from the reflog and is validated to be an amend (see
-    # _resolve_amend_pre_sha) — otherwise we fall back to full-commit review.
-    #
-    # Three guards skip the delta path and fall back to full `git show`
-    # review. All three close variants of "chained `git commit && git commit
-    # --amend` in one Bash call", which would otherwise enter the delta path,
-    # see an empty `git diff sha_wip sha_amend`, emit skip_reason=35, and
-    # silently drop the first commit's content from review (no prior
-    # PostToolUse fired for it — same Bash call):
-    #
-    # 1. `not _reflog_shas`: reflog fallback path was taken (both commits'
-    #    bash output suppressed via -q / pipe / redirect). The multi-SHA scan
-    #    already populates `shas` with every fresh commit (amend + any
-    #    pre-amend WIP) and the loop below `git show`s each, so coverage is
-    #    correct without delta — and the delta path doesn't compose with a
-    #    multi-SHA `shas` list (it would diff every entry against the same
-    #    pre-amend SHA). Losing the 30-60s saving on the reflog-fallback
-    #    fraction is an acceptable trade.
-    #
-    # 2. `len(all_shas) <= 1`: both commits visible (no -q). Two `[branch
-    #    sha]` lines in bash_output → all_shas len 2. Only defined on the
-    #    bash-output path; short-circuit ordering keeps it unevaluated when
-    #    `_reflog_shas` is non-empty.
-    #
-    # 3. `commit_invocations <= 1`: asymmetric — first commit -q, amend
-    #    visible. Fast-path fires on the amend's `[branch sha]` line (so
-    #    `_reflog_shas` stays empty), all_shas = [sha_amend] (len 1) — guards
-    #    1 and 2 both pass. The command string itself is the only remaining
-    #    signal that two commits happened. False-positives (e.g.
-    #    `git commit --amend -m "fix git commit bug"`) are safe — they fall
-    #    back to full review.
+    if not ENABLE_CODE_SECURITY_REVIEW or not HAS_API_CREDENTIALS:
+        debug_log("Commit review: LLM review disabled or no API credentials")
+        emit_metrics({"skipped": True, "skip_reason": 22, **_base})
+        sys.exit(0)
+    if not ensure_anthropic_reachable():
+        debug_log("Commit review: api.anthropic.com unreachable")
+        emit_metrics({"skipped": True, "skip_reason": 24, **_base})
+        sys.exit(0)
+    # `git commit --amend`: review only the delta added by the amend when a
+    # single fresh reflog entry proves the post-amend commit. Multiple commits
+    # in one tool call use full `git show` for each entry.
     is_amend = bool(_GIT_AMEND_RE.search(command))
-    commit_invocations = len(_GIT_COMMIT_RE.findall(command))
     pre_amend_sha = None
-    if (is_amend and not _reflog_shas and len(all_shas) <= 1
-            and commit_invocations <= 1):
+    if is_amend and len(shas) == 1:
         pre_amend_sha = _resolve_amend_pre_sha(repo_root, expected_post_sha=shas[0])
     if is_amend and pre_amend_sha:
         _base = {**_base, "amend_delta_review": True}
@@ -1616,103 +1456,70 @@ def handle_push_sweep_posttooluse(input_data):
         if repo_res in (RES_COMMAND, RES_TOUCHED_PATHS):
             save_repo_hint(session_id, repo_root)
 
-    # Guard: the sweep diffs `base..HEAD` and the agent Reads the working
-    # tree, so the pushed ref MUST be HEAD or the review is of the wrong
-    # range. `git push origin other` while checked out elsewhere, or a
-    # multi-ref push, are skipped (skip_reason 44). Check the new-tip from
-    # the `abc..def  local -> remote` line against HEAD.
-    #
-    # Scope range-line detection to the push section of bash_output: a chained
-    # `git fetch && git push` produces fetch range lines that the regex would
-    # otherwise match too, false-tripping multi-ref. `_push_section` slices
-    # forward from the last `To <remote>` header.
-    #
-    # If there are no range lines, we MUST also see a positive push-success
-    # signal (`* [new branch]` or `Everything up-to-date`) AND verify the
-    # pushed local ref resolves to HEAD before falling through to the
-    # @{u}@{1}/merge-base detection. Without this, two real cases misdirect
-    # the sweep: `git push origin feature2` while on `feature1` (no range
-    # line, no HEAD check → reviews wrong branch and poisons reviewed-shas),
-    # and rejected pushes (no range line, no `interrupted` signal → reviews
-    # unpushed local commits and marks them reviewed). skip_reason=46 covers
-    # both.
-    head = None
-    try:
-        # See #2099: drop text=True; decode manually for cp1252 safety.
-        r = subprocess.run([*GIT_CMD, "rev-parse", "HEAD"], cwd=repo_root,
-                           capture_output=True, timeout=5)
-        head = r.stdout.decode("utf-8", errors="replace").strip() if r.returncode == 0 else None
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        pass
+    # Review the pushed local ref, not the checked-out HEAD. A push can target
+    # another local branch while this worktree remains on a different branch.
+    def _resolve_local_ref(ref):
+        try:
+            result = subprocess.run(
+                [*GIT_CMD, "rev-parse", "--verify", "-q", ref],
+                cwd=repo_root, capture_output=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        value = result.stdout.decode("utf-8", errors="replace").strip()
+        return value if re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+    head = _resolve_local_ref("HEAD")
+    if not head:
+        emit_metrics({"skipped": True, "skip_reason": 44, **_base})
+        sys.exit(0)
     push_section = _push_section(bash_output or "")
     range_matches = list(_PUSH_RANGE_RE.finditer(push_section))
-    if range_matches and head:
-        # Multi-ref push (multiple range lines) or pushed-tip ≠ HEAD → skip.
-        if len(range_matches) > 1:
+    target_sha = head
+    if len(range_matches) > 1:
+        emit_metrics({"skipped": True, "skip_reason": 44, **_base})
+        sys.exit(0)
+    if range_matches:
+        match = range_matches[0]
+        local_ref, new_tip = match.group(3), match.group(2)
+        target_sha = _resolve_local_ref(local_ref)
+        if not target_sha or not target_sha.startswith(new_tip):
+            debug_log(f"Push sweep: pushed ref {local_ref} does not resolve to {new_tip}")
             emit_metrics({"skipped": True, "skip_reason": 44, **_base})
             sys.exit(0)
-        new_tip = range_matches[0].group(2)
-        if not head.startswith(new_tip):
-            debug_log(f"Push sweep: pushed tip {new_tip} != HEAD {head[:12]}")
-            emit_metrics({"skipped": True, "skip_reason": 44, **_base})
-            sys.exit(0)
-    elif head:
-        # No range lines. Need a positive push-success signal — otherwise
-        # the push may have failed and we'd review unpushed local commits.
+    else:
         new_branch_matches = re.findall(
             r"^\s*\*\s+\[new branch\]\s+(\S+)\s+->\s+\S+",
             push_section, re.M)
         up_to_date = "Everything up-to-date" in push_section
-        # `git push -q` suppresses all output on success. Distinguish quiet-
-        # success from a failed push (which has error text) by checking the
-        # upstream's reflog: a successful push leaves @{u}@{1} (the prior
-        # value) different from @{u} (now equal to HEAD). A rejected push
-        # would not advance @{u}, so this signal is push-specific.
-        quiet_success = False
-        if not (bash_output or "").strip() and not interrupted:
-            try:
-                # See #2099: drop text=True; decode manually for cp1252 safety.
-                r_cur = subprocess.run(
-                    [*GIT_CMD, "rev-parse", "--verify", "-q", "@{u}"],
-                    cwd=repo_root, capture_output=True, timeout=5)
-                r_prev = subprocess.run(
-                    [*GIT_CMD, "rev-parse", "--verify", "-q", "@{u}@{1}"],
-                    cwd=repo_root, capture_output=True, timeout=5)
-                cur = r_cur.stdout.decode("utf-8", errors="replace").strip() if r_cur.returncode == 0 else ""
-                prev_u = r_prev.stdout.decode("utf-8", errors="replace").strip() if r_prev.returncode == 0 else ""
-                quiet_success = bool(cur and prev_u and cur == head and prev_u != cur)
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                pass
-        if not (new_branch_matches or up_to_date or quiet_success):
-            debug_log("Push sweep: no push-success signal in bash output")
-            emit_metrics({"skipped": True, "skip_reason": 46, **_base})
-            sys.exit(0)
-        # `* [new branch] local -> remote`: verify the pushed local ref
-        # resolves to HEAD. `git push origin feature2` while on feature1
-        # would otherwise review feature1's commits and poison its
-        # reviewed-shas state.
-        for local_ref in new_branch_matches:
-            try:
-                # See #2099: drop text=True; decode manually for cp1252 safety.
-                r = subprocess.run(
-                    [*GIT_CMD, "rev-parse", "--verify", "-q", local_ref],
-                    cwd=repo_root, capture_output=True, timeout=5,
-                )
-                local_sha = r.stdout.decode("utf-8", errors="replace").strip() if r.returncode == 0 else ""
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                local_sha = ""
-            if local_sha and local_sha != head:
-                debug_log(f"Push sweep: new-branch {local_ref} ({local_sha[:12]}) != HEAD {head[:12]}")
+        if new_branch_matches:
+            if len(new_branch_matches) != 1:
                 emit_metrics({"skipped": True, "skip_reason": 44, **_base})
                 sys.exit(0)
+            target_sha = _resolve_local_ref(new_branch_matches[0])
+            if not target_sha:
+                emit_metrics({"skipped": True, "skip_reason": 44, **_base})
+                sys.exit(0)
+        elif up_to_date:
+            emit_metrics({**_base, "pushed": 0, "unreviewed": 0})
+            sys.exit(0)
+        else:
+            # Quiet pushes cannot identify a target ref or prove that this
+            # worktree's HEAD was the pushed ref. Do not review HEAD by guess.
+            emit_metrics({"skipped": True, "skip_reason": 46, **_base})
+            sys.exit(0)
 
     prev_upstream = _detect_prev_upstream(repo_root, bash_output)
+    if not prev_upstream and range_matches:
+        prev_upstream = range_matches[0].group(1)
     if not prev_upstream:
         debug_log("Push sweep: could not determine prev_upstream")
         emit_metrics({"skipped": True, "skip_reason": 41, **_base})
         sys.exit(0)
 
-    push_range = _git_rev_list_range(repo_root, prev_upstream, "HEAD")
+    push_range = _git_rev_list_range(repo_root, prev_upstream, target_sha)
     if not push_range:
         emit_metrics({"skipped": True, "skip_reason": 42, **_base, "pushed": 0})
         sys.exit(0)
@@ -1734,7 +1541,7 @@ def handle_push_sweep_posttooluse(input_data):
     debug_log(f"Push sweep: range={len(push_range)} prefix_advanced="
               f"{prefix_advanced} base={base[:12]} tail={len(tail)}")
 
-    diff_text = _git_diff_range(repo_root, base, "HEAD")
+    diff_text = _git_diff_range(repo_root, base, target_sha)
     if diff_text is None:
         # Diff failed (non-zero exit / 30s timeout / git missing). Do NOT
         # mark `tail` reviewed — we did not actually review it. Marking

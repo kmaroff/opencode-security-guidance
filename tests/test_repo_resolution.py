@@ -300,16 +300,16 @@ class TestCommitReview:
         assert m["repo_resolution"] == rr.RES_COMMAND and m["sha_via_reflog"] is True
         assert m["files_reviewed"] == 1
 
-    def test_workspace_cwd_sha_scan(self, workspace, hook_env, stub_api):
+    def test_workspace_cwd_without_target_ref_skips(self, workspace, hook_env, stub_api):
         ws, repo = workspace
         sha, out = commit_file(repo, "app.py", VULN_PY)
         rc, so, se = run_hook(bash_payload(ws, "git commit -m change", out), hook_env)
         m = metrics_of(so)
-        assert m.get("skip_reason") is None, m
-        assert m["repo_resolution"] == rr.RES_SHA_SCAN and m["files_reviewed"] == 1
-        assert "repo_root_hint" not in _read_state_or_empty(hook_env)
+        assert m["skip_reason"] == 26
+        assert m["cwd_is_repo"] is False
+        assert m["repo_resolution"] == rr.RES_NONE
 
-    def test_workspace_cwd_sha_scan_via_project_dir(self, workspace, hook_env, tmp_path):
+    def test_workspace_project_dir_without_target_ref_skips(self, workspace, hook_env, tmp_path):
         ws, repo = workspace
         sha, out = commit_file(repo, "app.py", VULN_PY)
         elsewhere = tmp_path / "elsewhere"
@@ -317,8 +317,8 @@ class TestCommitReview:
         env = {**hook_env, "CLAUDE_PROJECT_DIR": str(ws)}
         rc, so, se = run_hook(bash_payload(elsewhere, "git commit -m change", out), env)
         m = metrics_of(so)
-        assert m.get("skip_reason") is None, m
-        assert m["repo_resolution"] == rr.RES_SHA_SCAN
+        assert m["skip_reason"] == 26
+        assert m["cwd_is_repo"] is False
 
     def test_hint_saved_and_used(self, workspace, hook_env):
         ws, repo = workspace

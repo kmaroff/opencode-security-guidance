@@ -5,12 +5,11 @@ stdout is protocol JSON only. Diagnostics are bounded and go to stderr.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -27,10 +26,12 @@ from diffstate import (  # noqa: E402
 )
 from security_reminder_hook import (  # noqa: E402
     _compute_push_sweep_base,
-    _detect_prev_upstream,
+    _detect_main_branch,
     _git_rev_list_range,
+    _PUSH_RANGE_RE,
+    _push_section,
 )
-from extensibility import load_for_session  # noqa: E402
+from extensibility import guidance_block, load_for_session  # noqa: E402
 from gitutil import (  # noqa: E402
     GIT_CMD,
     _git_diff_range,
@@ -40,6 +41,7 @@ from gitutil import (  # noqa: E402
     get_git_diff,
     parse_diff_into_files,
 )
+from reporesolve import COMMIT_SUBCOMMANDS, PUSH_SUBCOMMANDS, toplevel_from_command  # noqa: E402
 from patterns import SECURITY_PATTERNS  # noqa: E402
 from review_api import filter_by_severity  # noqa: E402
 from security_reminder_hook import check_patterns  # noqa: E402
@@ -47,7 +49,14 @@ from security_reminder_hook import check_patterns  # noqa: E402
 PROTOCOL_VERSION = "1"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_DIFF_BYTES = 1_000_000
-SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b", re.I)
+MAX_DIFF_FILES = 200
+FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.I)
+
+
+class BridgeGitError(RuntimeError):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
 
 
 def _error(kind: str, message: str) -> dict[str, Any]:
@@ -67,6 +76,37 @@ def _matches(path: str, content: str, baseline: str | None = None, cwd: str | No
     return {"matches": [{"ruleName": rule, "reminder": reminder} for rule, reminder in pairs]}
 
 
+def _repo_for_command(cwd: str, command: str, subcommands: set[tuple[str, str]]) -> str | None:
+    if not cwd:
+        return None
+    root = _git_toplevel(cwd)
+    command_root = toplevel_from_command(command, cwd, subcommands, root)
+    return command_root or root
+
+
+def _resolve_sha(repo: str, ref: str, kind: str) -> str:
+    if not isinstance(ref, str) or not ref:
+        raise BridgeGitError(kind, "missing Git ref")
+    try:
+        result = subprocess.run([*GIT_CMD, "rev-parse", "--verify", "-q", ref], cwd=repo, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BridgeGitError(kind, "Git ref resolution failed") from exc
+    value = result.stdout.decode("utf-8", "replace").strip()
+    if result.returncode != 0 or not FULL_SHA_RE.fullmatch(value):
+        raise BridgeGitError(kind, "Git ref resolution failed")
+    return value
+
+
+def _rev_list(repo: str, old: str, new: str, kind: str) -> list[str]:
+    try:
+        result = subprocess.run([*GIT_CMD, "rev-list", "--reverse", f"{old}..{new}"], cwd=repo, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BridgeGitError(kind, "Git revision range failed") from exc
+    if result.returncode != 0:
+        raise BridgeGitError(kind, "Git revision range failed")
+    return [line for line in result.stdout.decode("utf-8", "replace").splitlines() if FULL_SHA_RE.fullmatch(line)]
+
+
 def _review_set(request: dict[str, Any]) -> dict[str, Any]:
     cwd = str(request.get("cwd") or "")
     paths, diff_base, repo, untracked, metrics = compute_v2_review_set(
@@ -76,19 +116,22 @@ def _review_set(request: dict[str, Any]) -> dict[str, Any]:
         request.get("untrackedAtBaseline") or {},
     )
     if not repo or not paths:
-        return {"repoRoot": repo, "paths": paths, "diffBase": diff_base, "diff": "", "diffFiles": [], "metrics": metrics}
+        return {"repoRoot": repo, "paths": paths, "diffBase": diff_base, "diff": "", "diffFiles": [], "diffAvailable": True, "diffStatus": "VALID_EMPTY_DIFF", "metrics": metrics}
     baseline = request.get("baselineSha") or diff_base
     diff = get_git_diff(repo, baseline, full_context=False, paths=paths, untracked_paths=untracked)
     if diff is None and baseline != diff_base:
         diff = get_git_diff(repo, diff_base, full_context=False, paths=paths, untracked_paths=untracked)
-    diff = diff or ""
+    if diff is None:
+        raise BridgeGitError("git_diff_failed", "Git diff extraction failed")
     files = filter_preexisting_from_diff(parse_diff_into_files(diff), repo, baseline)
     return {
         "repoRoot": repo,
         "paths": paths,
         "diffBase": diff_base,
         "diff": diff[:MAX_DIFF_BYTES],
-        "diffFiles": [[path, body] for path, body in files],
+        "diffFiles": [[path, body[:MAX_DIFF_BYTES]] for path, body in files[:MAX_DIFF_FILES]],
+        "diffAvailable": True,
+        "diffStatus": "VALID_DIFF" if diff else "VALID_EMPTY_DIFF",
         "metrics": metrics,
     }
 
@@ -96,75 +139,121 @@ def _review_set(request: dict[str, Any]) -> dict[str, Any]:
 def _commit_data(request: dict[str, Any]) -> dict[str, Any]:
     cwd = str(request.get("cwd") or "")
     command = str(request.get("command") or "")
-    output = str(request.get("output") or "")
-    repo = _git_toplevel(cwd) if cwd else None
+    repo = _repo_for_command(cwd, command, COMMIT_SUBCOMMANDS)
     if not repo:
-        return {"repoRoot": None, "shas": [], "diffFiles": []}
-    shas = SHA_RE.findall(output)
-    if not shas and re.search(r"(?:\d+\s+files?\s+changed|create mode\s+\d+|nothing to commit)", output, re.I) and re.search(r"(?:^|[;&|])\s*(?:git|gt)\b[^;&|]*(?:commit|create|modify)\b", command):
-        # Hidden output is accepted only when Git emitted a success-shaped
-        # diffstat. Never infer success from an ambiguous tool failure.
-        head = _git_rev_parse_head(repo)
-        if head:
-            shas = [head]
-    full: list[str] = []
-    seen: set[str] = set()
-    import subprocess
-    for sha in reversed(shas):
-        try:
-            p = subprocess.run([*GIT_CMD, "rev-parse", "--verify", "-q", sha], cwd=repo, capture_output=True, timeout=5)
-            resolved = p.stdout.decode("utf-8", "replace").strip() if p.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            resolved = ""
-        if resolved and resolved not in seen:
-            seen.add(resolved)
-            full.append(resolved)
+        raise BridgeGitError("commit_target_resolution_failed", "commit repository could not be resolved")
+    if request.get("interrupted") or (isinstance(request.get("exitCode"), int) and request["exitCode"] != 0):
+        raise BridgeGitError("commit_failed", "commit operation did not succeed")
+    before = _resolve_sha(repo, str(request.get("beforeHead") or ""), "commit_target_resolution_failed")
+    after = _resolve_sha(repo, "HEAD", "commit_target_resolution_failed")
+    if before == after:
+        return {"repoRoot": repo, "oldSha": before, "newSha": after, "shas": [], "diffFiles": [], "diffAvailable": True, "diffStatus": "VALID_EMPTY_DIFF", "noOp": True}
+    if re.search(r"\b(?:git|gt)\b[^;&|]*(?:commit|create|modify)\b", command, re.I) is None:
+        raise BridgeGitError("commit_target_resolution_failed", "commit command semantics were not verified")
+    try:
+        normal = subprocess.run([*GIT_CMD, "merge-base", "--is-ancestor", before, after], cwd=repo, capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BridgeGitError("commit_target_resolution_failed", "commit ancestry check failed") from exc
+    shas = _rev_list(repo, before, after, "commit_target_resolution_failed") if normal.returncode == 0 else [after]
     files: list[tuple[str, str]] = []
-    for sha in full:
+    for sha in shas:
         try:
-            p = subprocess.run([*GIT_CMD, "show", "-p", "--no-color", "--no-ext-diff", "--no-textconv", sha, "--"], cwd=repo, capture_output=True, timeout=15)
-            if p.returncode == 0:
-                files.extend(parse_diff_into_files(p.stdout.decode("utf-8", "replace")))
-        except (OSError, subprocess.SubprocessError):
-            continue
+            result = subprocess.run([*GIT_CMD, "show", "-p", "--no-color", "--no-ext-diff", "--no-textconv", sha, "--"], cwd=repo, capture_output=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BridgeGitError("git_show_failed", "Git commit extraction failed") from exc
+        if result.returncode != 0:
+            raise BridgeGitError("git_show_failed", "Git commit extraction failed")
+        files.extend(parse_diff_into_files(result.stdout.decode("utf-8", "replace")))
     unique: list[list[str]] = []
     seen_paths: set[str] = set()
-    for path, body in files:
-        if path not in seen_paths:
-            seen_paths.add(path)
-            unique.append([path, body[:MAX_DIFF_BYTES]])
-    return {"repoRoot": repo, "shas": full, "diffFiles": unique}
+    for file_path, body in files:
+        if file_path not in seen_paths:
+            seen_paths.add(file_path)
+            unique.append([file_path, body[:MAX_DIFF_BYTES]])
+    return {"repoRoot": repo, "oldSha": before, "newSha": after, "shas": shas, "diffFiles": unique[:MAX_DIFF_FILES], "diffAvailable": True, "diffStatus": "VALID_DIFF" if unique else "VALID_EMPTY_DIFF", "noOp": False}
 
 
 def _push_data(request: dict[str, Any]) -> dict[str, Any]:
     cwd = str(request.get("cwd") or "")
+    command = str(request.get("command") or "")
     output = str(request.get("output") or "")
-    repo = _git_toplevel(cwd) if cwd else None
+    repo = _repo_for_command(cwd, command, PUSH_SUBCOMMANDS)
     if not repo:
-        return {"repoRoot": None, "shas": [], "diffFiles": [], "base": None}
-    previous = _detect_prev_upstream(repo, output)
-    if not previous:
-        return {"repoRoot": repo, "shas": [], "diffFiles": [], "base": None}
-    pushed = _git_rev_list_range(repo, previous, "HEAD")
+        raise BridgeGitError("push_target_resolution_failed", "push repository could not be resolved")
+    if request.get("interrupted") or (isinstance(request.get("exitCode"), int) and request["exitCode"] != 0):
+        raise BridgeGitError("push_failed", "push operation did not succeed")
+    section = _push_section(output)
+    ranges = list(_PUSH_RANGE_RE.finditer(section))
+    if len(ranges) > 1:
+        raise BridgeGitError("push_target_resolution_failed", "multiple pushed refs were reported")
+    new_branch = re.findall(r"^\s*\*\s+\[new branch\]\s+(\S+)\s+->\s+(\S+)", section, re.M)
+    if len(new_branch) > 1:
+        raise BridgeGitError("push_target_resolution_failed", "multiple pushed refs were reported")
+    if ranges:
+        match = ranges[0]
+        old_token, new_token, local_ref, remote_ref = match.groups()
+        old_sha = _resolve_sha(repo, old_token, "push_target_resolution_failed")
+        new_sha = _resolve_sha(repo, local_ref, "push_target_resolution_failed")
+        if not new_sha.startswith(new_token.lower()):
+            raise BridgeGitError("push_target_resolution_failed", "pushed local ref does not match reported new SHA")
+        remote_name = remote_ref if remote_ref.startswith("refs/") else f"refs/heads/{remote_ref}"
+    elif new_branch:
+        local_ref, remote_ref = new_branch[0]
+        old_sha = None
+        new_sha = _resolve_sha(repo, local_ref, "push_target_resolution_failed")
+        remote_name = remote_ref if remote_ref.startswith("refs/") else f"refs/heads/{remote_ref}"
+        main = _detect_main_branch(repo)
+        if not main:
+            raise BridgeGitError("push_target_resolution_failed", "new branch base could not be resolved")
+        try:
+            base_result = subprocess.run([*GIT_CMD, "merge-base", new_sha, main], cwd=repo, capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise BridgeGitError("push_target_resolution_failed", "new branch base failed") from exc
+        if base_result.returncode != 0:
+            raise BridgeGitError("push_target_resolution_failed", "new branch base failed")
+        old_sha = base_result.stdout.decode("utf-8", "replace").strip()
+    elif "everything up-to-date" in section.lower():
+        return {"repoRoot": repo, "oldSha": None, "newSha": None, "remoteRef": None, "shas": [], "tail": [], "diffFiles": [], "base": None, "diffAvailable": True, "diffStatus": "VALID_EMPTY_DIFF", "alreadyReviewed": False, "noOp": True}
+    else:
+        raise BridgeGitError("push_target_resolution_failed", "push success and target were not proven")
+    if not old_sha or not FULL_SHA_RE.fullmatch(old_sha):
+        raise BridgeGitError("push_target_resolution_failed", "push old SHA was not resolved")
+    pushed = _rev_list(repo, old_sha, new_sha, "push_target_resolution_failed")
     reviewed = _load_reviewed_shas(repo)
-    base, tail = _compute_push_sweep_base(previous, pushed, reviewed)
+    base, tail = _compute_push_sweep_base(old_sha, pushed, reviewed)
     if base is None:
-        return {"repoRoot": repo, "shas": pushed, "tail": [], "diffFiles": [], "base": None, "alreadyReviewed": True}
-    diff = _git_diff_range(repo, base, "HEAD")
-    files = parse_diff_into_files(diff or "")
-    return {"repoRoot": repo, "shas": pushed, "tail": tail, "diffFiles": [[p, b[:MAX_DIFF_BYTES]] for p, b in files], "base": base, "alreadyReviewed": False}
+        return {"repoRoot": repo, "oldSha": old_sha, "newSha": new_sha, "remoteRef": remote_name, "shas": pushed, "tail": [], "diffFiles": [], "base": None, "diffAvailable": True, "diffStatus": "VALID_EMPTY_DIFF", "alreadyReviewed": True}
+    diff = _git_diff_range(repo, base, new_sha)
+    if diff is None:
+        raise BridgeGitError("git_diff_failed", "Git push diff extraction failed")
+    files = parse_diff_into_files(diff)
+    return {"repoRoot": repo, "oldSha": old_sha, "newSha": new_sha, "remoteRef": remote_name, "shas": pushed, "tail": tail, "diffFiles": [[p, b[:MAX_DIFF_BYTES]] for p, b in files[:MAX_DIFF_FILES]], "base": base, "diffAvailable": True, "diffStatus": "VALID_DIFF" if diff else "VALID_EMPTY_DIFF", "alreadyReviewed": False}
 
+def _operation_before(request: dict[str, Any]) -> dict[str, Any]:
+    cwd = str(request.get("cwd") or "")
+    command = str(request.get("command") or "")
+    operation = str(request.get("operation") or "")
+    subcommands = COMMIT_SUBCOMMANDS if operation == "commit" else PUSH_SUBCOMMANDS
+    repo = _repo_for_command(cwd, command, subcommands)
+    if not repo:
+        kind = "push_target_resolution_failed" if operation == "push" else "commit_target_resolution_failed"
+        raise BridgeGitError(kind, "operation repository could not be resolved")
+    head = _git_rev_parse_head(repo)
+    if not head:
+        kind = "push_target_resolution_failed" if operation == "push" else "commit_target_resolution_failed"
+        raise BridgeGitError(kind, "operation pre-head could not be resolved")
+    return {"repoRoot": repo, "preHead": head}
 
 def _mark_reviewed(request: dict[str, Any]) -> dict[str, Any]:
     repo = str(request.get("repoRoot") or "")
-    shas = [s for s in request.get("shas", []) if isinstance(s, str) and re.fullmatch(r"[0-9a-f]{40}", s)]
+    shas = [s for s in request.get("shas", []) if isinstance(s, str) and FULL_SHA_RE.fullmatch(s)]
     if not repo or not shas:
-        return {"acknowledged": not shas, "shas": []}
+        return {"acknowledged": False, "shas": []}
     _append_reviewed_shas(repo, shas, vulns_found=int(request.get("findings", 0) or 0))
     current = _load_reviewed_shas(repo)
     missing = [sha for sha in shas if sha not in current]
     if missing:
-        raise RuntimeError("reviewed SHA acknowledgement failed")
+        raise BridgeGitError("reviewed_sha_ack_failed", "reviewed SHA acknowledgement failed")
     return {"acknowledged": True, "shas": shas}
 
 
@@ -178,8 +267,10 @@ def dispatch(request: dict[str, Any]) -> Any:
         return {"upstream": "da823e86c8feef13b73b6712af11eadd38c992f6", "patternRules": len(SECURITY_PATTERNS), "python": sys.version.split()[0]}
     if op == "pattern.scan":
         return _matches(str(request.get("path") or ""), str(request.get("content") or ""), request.get("baselineContent"), request.get("cwd"))
+    if op == "review.guidance":
+        load_for_session(str(request.get("cwd") or ""))
+        return {"guidance": guidance_block()}
     if op == "git.baselineContent":
-        import subprocess
         baseline = request.get("baselineSha")
         file_path = str(request.get("path") or "")
         cwd = str(request.get("cwd") or "")
@@ -192,6 +283,8 @@ def dispatch(request: dict[str, Any]) -> Any:
         except (OSError, subprocess.SubprocessError, ValueError):
             content = None
         return {"content": content}
+    if op == "git.operationBefore":
+        return _operation_before(request)
     if op == "git.capture":
         cwd = str(request.get("cwd") or "")
         return {"baselineSha": capture_git_baseline(cwd), "headAtCapture": _git_rev_parse_head(cwd), "untrackedAtBaseline": _list_untracked(cwd)}
@@ -212,6 +305,7 @@ def dispatch(request: dict[str, Any]) -> Any:
     raise ValueError(f"unknown operation: {op!r}")
 
 
+
 def main() -> int:
     raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
     if len(raw) > MAX_REQUEST_BYTES:
@@ -222,6 +316,9 @@ def main() -> int:
         response = _result(dispatch(request))
     except json.JSONDecodeError as exc:
         response = _error("invalid_json", f"invalid JSON at {exc.pos}")
+    except BridgeGitError as exc:
+        print(f"bridge error: {exc.kind}", file=sys.stderr, flush=True)
+        response = _error(exc.kind, str(exc))
     except Exception as exc:  # bridge boundary: never emit traceback on stdout
         print(f"bridge error: {type(exc).__name__}: {str(exc)[:240]}", file=sys.stderr, flush=True)
         response = _error("bridge_error", type(exc).__name__)
